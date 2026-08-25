@@ -42,6 +42,7 @@
 
 #include <nuttx/arch.h>
 #include <nuttx/irq.h>
+#include <nuttx/sched.h>
 #include <nuttx/clock.h>
 #include <nuttx/mutex.h>
 #include <nuttx/semaphore.h>
@@ -564,19 +565,33 @@ static void esp_i2c_sendstart(struct esp_i2c_priv_s *priv)
 {
   struct i2c_msg_s *msg = &priv->msgv[priv->msgid];
   uint32_t fifo_val = 0;
-  i2c_ll_hw_cmd_t restart_cmd;
-  i2c_ll_hw_cmd_t write_cmd;
-  i2c_ll_hw_cmd_t end_cmd;
+  /* The hw command structs are bit-field unions written verbatim into
+   * the command registers: EVERY field must be initialized.  Leaving
+   * them as stack garbage intermittently set ack_exp/ack_val on the
+   * WRITE command, making the controller treat the slave's genuine ACK
+   * as a NACK error (verified on the wire: address ACKed, controller
+   * aborted).  The stack-content lottery explained days of per-boot,
+   * per-caller phantom I2C failures.
+   */
+
+  i2c_ll_hw_cmd_t restart_cmd =
+    {
+      .op_code = I2C_LL_CMD_RESTART
+    };
+
+  i2c_ll_hw_cmd_t write_cmd =
+    {
+      .byte_num = 1,
+      .ack_en = 1,
+      .op_code = I2C_LL_CMD_WRITE
+    };
+
+  i2c_ll_hw_cmd_t end_cmd =
+    {
+      .op_code = I2C_LL_CMD_END
+    };
 
   /* Write I2C command registers */
-
-  restart_cmd.op_code = I2C_LL_CMD_RESTART;
-
-  write_cmd.byte_num = 1;
-  write_cmd.ack_en = 1;
-  write_cmd.op_code = I2C_LL_CMD_WRITE;
-
-  end_cmd.op_code = I2C_LL_CMD_END;
 
   i2c_ll_master_write_cmd_reg(priv->ctx->dev, restart_cmd, 0);
   i2c_ll_master_write_cmd_reg(priv->ctx->dev, write_cmd, 1);
@@ -689,8 +704,15 @@ static void esp_i2c_startrecv(struct esp_i2c_priv_s *priv)
   int ack_value = 0;
   struct i2c_msg_s *msg = &priv->msgv[priv->msgid];
   int n = msg->length - priv->bytes;
-  i2c_ll_hw_cmd_t read_cmd;
-  i2c_ll_hw_cmd_t end_cmd;
+  i2c_ll_hw_cmd_t read_cmd =
+    {
+      0
+    };
+
+  i2c_ll_hw_cmd_t end_cmd =
+    {
+      .op_code = I2C_LL_CMD_END
+    };
 
   if (n > 1)
     {
@@ -708,7 +730,6 @@ static void esp_i2c_startrecv(struct esp_i2c_priv_s *priv)
   read_cmd.op_code = I2C_LL_CMD_READ;
   i2c_ll_master_write_cmd_reg(priv->ctx->dev, read_cmd, 0);
 
-  end_cmd.op_code = I2C_LL_CMD_END;
   i2c_ll_master_write_cmd_reg(priv->ctx->dev, end_cmd, 1);
 
   /* Enable I2C master RX interrupt */
@@ -1009,8 +1030,29 @@ static void esp_i2c_reset_fsmc(struct esp_i2c_priv_s *priv)
 #ifndef CONFIG_I2C_POLLED
 static int esp_i2c_sem_waitdone(struct esp_i2c_priv_s *priv)
 {
-  return nxsem_tickwait_uninterruptible(&priv->sem_isr,
-                                        ESPRESSIF_I2CTIMEOTICKS);
+  uint32_t us;
+
+  /* Poll instead of blocking.  The controller executes a transaction in
+   * hardware-suspended segments (address phase, END interrupt, data
+   * phase programmed by the ISR).  The caller holds sched_lock() across
+   * the transaction so no other thread's interrupt-masked sections can
+   * stall the ISR-driven continuation mid-transaction - blocking on the
+   * semaphore here would defeat that by yielding the CPU.  Interrupts
+   * (and thus the I2C ISR) run normally during this poll; a normal
+   * transaction completes in tens to hundreds of microseconds.
+   */
+
+  for (us = 0; us < 500 * 1000; us += 5)
+    {
+      if (nxsem_trywait(&priv->sem_isr) == OK)
+        {
+          return OK;
+        }
+
+      up_udelay(5);
+    }
+
+  return -ETIMEDOUT;
 }
 #endif
 
@@ -1166,8 +1208,36 @@ static int esp_i2c_transfer(struct i2c_master_s *dev,
 
   priv->msgv = msgs;
 
+  /* Hold off preemption for the duration of the transaction.  The
+   * hardware runs it in segments glued together by the ISR (address
+   * phase, END interrupt, data phase, STOP); if another thread runs
+   * a long interrupt-masked section between segments, the controller
+   * aborts the suspended transaction and reports a phantom NACK even
+   * though the slave ACKed on the wire (verified with a pad-level
+   * protocol decode).  Interrupts, including the I2C ISR, still run.
+   */
+
+  sched_lock();
+
   for (int i = 0; i < count; i++)
     {
+      /* The TRANS_COMPLETE interrupt fires before the STOP condition has
+       * fully drained onto the wire (a STOP takes several bit times -
+       * tens of microseconds at 100 kHz).  Reprogramming the timing or
+       * command registers while the previous STOP is still draining
+       * corrupts the FSM: the next address phase then aborts with a
+       * phantom NACK even though the slave ACKs on the wire (verified
+       * with a pad-level protocol decode).  Wait for the controller to
+       * report the bus idle before setting up the next transaction.
+       */
+
+      for (uint32_t busy_us = 0;
+           i2c_ll_is_bus_busy(priv->ctx->dev) && busy_us < 1000;
+           busy_us++)
+        {
+          up_udelay(1);
+        }
+
       esp_i2c_reset_fifo(priv);
 
       priv->bytes = 0;
@@ -1218,6 +1288,18 @@ static int esp_i2c_transfer(struct i2c_master_s *dev,
         }
       else
         {
+          /* Enforce a quiet gap after every completed message before the
+           * next transaction may begin.  Back-to-back transactions on
+           * this controller intermittently abort at the address phase
+           * with a phantom NACK (a pad-level protocol decode shows the
+           * slave ACKing on the wire while the controller reports NACK
+           * and stops).  300 us was measured insufficient; 1 ms was
+           * clean until the SDIO host (esp-hosted Wi-Fi) added steady
+           * bus-master traffic, under which 2 ms is required.
+           */
+
+          up_udelay(2000);
+
           if (priv->error != 0)
             {
               i2cerr("Transfer error %" PRIu32 "\n", priv->error);
@@ -1255,6 +1337,8 @@ static int esp_i2c_transfer(struct i2c_master_s *dev,
 
         i2cinfo("Message %" PRIu8 " transfer complete.\n", priv->msgid);
     }
+
+  sched_unlock();
 
   /* Dump the trace result */
 
@@ -1328,9 +1412,17 @@ static int esp_i2c_reset(struct i2c_master_s *dev)
 
   DEBUGASSERT(priv->refs > 0);
 
+  nxmutex_lock(&priv->lock);
   flags = enter_critical_section();
 
-  esp_i2c_reset_fsmc(priv);
+  /* An FSM reset alone has been observed to leave the controller in a
+   * state where every write-direction transfer reports NACK while pure
+   * reads keep working.  Recover with a full peripheral re-init:
+   * clock-gate toggle, HAL init, pin matrix routing and bus timing.
+   */
+
+  esp_i2c_deinit(priv);
+  esp_i2c_init(priv);
 
   /* Clear bus */
 
@@ -1342,6 +1434,7 @@ static int esp_i2c_reset(struct i2c_master_s *dev)
   priv->ready_read = false;
 
   leave_critical_section(flags);
+  nxmutex_unlock(&priv->lock);
 
   return OK;
 }
