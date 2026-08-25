@@ -46,6 +46,29 @@
 #  define RMT_OUTPUT_PIN    8
 #endif
 
+/* SDIO link to the on-board ESP32-C6 (esp-hosted, Stage 1) *****************/
+
+#ifdef CONFIG_ESP32P4_SDMMC
+
+/* The C6 is on SDMMC slot 1, routed through the GPIO matrix.  The SDIO bus
+ * pins (CLK/CMD/D0..D3) are configured by the arch driver from the
+ * CONFIG_ESP32P4_SDMMC_* symbols (defaults: CLK=18 CMD=19 D0=14 D1=15
+ * D2=16 D3=17).
+ */
+
+#  define BOARD_SDMMC_SLOT       CONFIG_ESP32P4_SDMMC_SLOT
+
+/* ESP32-C6 reset line: ACTIVE-HIGH (drive high to assert reset, low to
+ * run).  Shared with the esp-hosted menu if that symbol is configured.
+ */
+
+#  ifdef CONFIG_ESPRESSIF_ESP_HOSTED_SDIO_RESET
+#    define BOARD_C6_RESET_GPIO  CONFIG_ESPRESSIF_ESP_HOSTED_SDIO_RESET
+#  else
+#    define BOARD_C6_RESET_GPIO  54
+#  endif
+#endif
+
 /****************************************************************************
  * Public Types
  ****************************************************************************/
@@ -130,6 +153,23 @@ int esp_gpio_init(void);
 
 #ifdef CONFIG_ESPRESSIF_EMAC
 int board_emac_init(void);
+#endif
+
+/****************************************************************************
+ * Name: board_sdmmc_init
+ *
+ * Description:
+ *   Stage-1 esp-hosted bring-up: reset the on-board ESP32-C6, bring up the
+ *   SDMMC host on slot 1 as an SDIO host, probe the C6 as an SDIO card and
+ *   log its CCCR revision and CIS vendor ID.
+ *
+ * Returned Value:
+ *   Zero (OK) on success; a negated errno value on failure.
+ *
+ ****************************************************************************/
+
+#ifdef CONFIG_ESP32P4_SDMMC
+int board_sdmmc_init(void);
 #endif
 
 #endif /* __ASSEMBLY__ */

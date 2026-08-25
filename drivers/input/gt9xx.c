@@ -156,6 +156,10 @@ static const struct file_operations g_gt9xx_fileops =
 static unsigned int g_gt9xx_rdfail;
 static unsigned int g_gt9xx_fail_streak;
 
+/* Successful reads, for a board-level "touch never came up" watchdog */
+
+volatile uint32_t g_gt9xx_good;
+
 /****************************************************************************
  * Name: gt9xx_i2c_read
  *
@@ -233,7 +237,7 @@ static int gt9xx_i2c_read(FAR struct gt9xx_dev_s *dev,
               break;
             }
 
-          nxsig_usleep(5000);
+          up_udelay(5000);
         }
     }
 
@@ -274,6 +278,7 @@ static int gt9xx_i2c_read(FAR struct gt9xx_dev_s *dev,
     }
 
   g_gt9xx_fail_streak = 0;
+  g_gt9xx_good++;
 
 #ifdef CONFIG_DEBUG_INPUT_INFO
   iinfodumpbuffer("gt9xx_i2c_read", buf, buflen);
@@ -352,7 +357,7 @@ static int gt9xx_i2c_write(FAR struct gt9xx_dev_s *dev,
               break;
             }
 
-          nxsig_usleep(5000);
+          up_udelay(5000);
         }
     }
 
@@ -974,9 +979,13 @@ static int gt9xx_open(FAR struct file *filep)
           goto out_lock;
         }
 
-      /* Let Touch Panel power up before probing */
+      /* Let Touch Panel power up before probing.  Busy-wait on purpose:
+       * a lost timer wakeup in nxsig_usleep here parks the whole boot
+       * inside open() for minutes (stack-scan verified on hardware),
+       * and a signal cannot rescue a kthread with signals masked.
+       */
 
-      nxsig_usleep(100 * 1000);
+      up_mdelay(100);
 
       /* Check that Touch Panel exists on I2C */
 
@@ -1001,7 +1010,7 @@ static int gt9xx_open(FAR struct file *filep)
                          priv->addr);
                 }
 
-              nxsig_usleep(50 * 1000);
+              up_mdelay(50);
             }
         }
 

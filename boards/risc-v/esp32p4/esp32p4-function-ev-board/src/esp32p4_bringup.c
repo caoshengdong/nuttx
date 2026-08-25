@@ -561,6 +561,18 @@ int esp_bringup(void)
     }
 #endif
 
+#ifdef CONFIG_ESP32P4_SDMMC
+  /* Stage-1 esp-hosted probe: bring up the SDIO link to the ESP32-C6 and
+   * enumerate it as an SDIO card.
+   */
+
+  ret = board_sdmmc_init();
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ERROR: board_sdmmc_init failed: %d\n", ret);
+    }
+#endif
+
 #ifdef CONFIG_ESPRESSIF_USE_LP_CORE
 #  ifdef CONFIG_ESPRESSIF_LP_MAILBOX
   esp_lp_mailbox_init();
