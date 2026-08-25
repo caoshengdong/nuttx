@@ -108,6 +108,14 @@ if(CONFIG_ESP_SDM)
   list(APPEND SRCS esp_sdm.c)
 endif()
 
+if(CONFIG_ESP32P4_SDMMC)
+  list(APPEND SRCS esp32p4_sdmmc.c)
+endif()
+
+if(CONFIG_ESPRESSIF_MIPI_CSI)
+  list(APPEND SRCS esp_mipi_csi.c)
+endif()
+
 if(CONFIG_ESPRESSIF_DEDICATED_GPIO)
   list(APPEND SRCS esp_dedic_gpio.c)
 endif()
