@@ -25,6 +25,7 @@
  ****************************************************************************/
 
 #include <nuttx/config.h>
+#include <syslog.h>
 #include <nuttx/kmalloc.h>
 #include <nuttx/spinlock.h>
 
@@ -51,6 +52,7 @@
 #include "esp_rom_sys.h"
 #include "riscv/interrupt.h"
 #include "soc/soc.h"
+#include "soc/interrupts.h"
 
 #if SOC_INT_CLIC_SUPPORTED
 #  include "hal/interrupt_clic_ll.h"
@@ -294,6 +296,19 @@ void up_irqinitialize(void)
         {
           g_handle_map[j][i] = IRQ_UNMAPPED;
         }
+    }
+
+  /* Clear every peripheral route in the interrupt matrix.  The ROM
+   * leaves stale routes behind (e.g. UART0 -> CLIC line 21 used by the
+   * boot console); the interrupt allocator does not know about them, so
+   * a CPU interrupt reused for a new peripheral would still receive the
+   * foreign source and storm with the new peripheral's status reading
+   * zero (observed with the first AHB-GDMA user, I2S).
+   */
+
+  for (i = 0; i < ETS_MAX_INTR_SOURCE; i++)
+    {
+      putreg32(0, DR_REG_INTERRUPT_CORE0_BASE + 4 * i);
     }
 
   /* Initialize CPU interrupts */
@@ -559,6 +574,11 @@ void esp_teardown_irq(int source, int cpuint)
  *
  ****************************************************************************/
 
+/* PROBE: how many CPU interrupts arrived with no handler, and which. */
+
+volatile uint32_t g_irq_nohandler_count;
+volatile uint32_t g_irq_nohandler_last;
+
 IRAM_ATTR void *riscv_dispatch_irq(uintreg_t mcause, uintreg_t *regs)
 {
   int irq;
@@ -581,6 +601,18 @@ IRAM_ATTR void *riscv_dispatch_irq(uintreg_t mcause, uintreg_t *regs)
            * if the interrupt was triggered but not properly registered.
            */
 
+          /* No handler is registered for this CPU interrupt.  This happens
+           * for a spurious or stale CLIC-pending interrupt, or one taken in
+           * the brief window after esp_intr_alloc() re-enables interrupts but
+           * before esp_setup_irq() finishes registering its handle.  Left
+           * alone, a level-type pending would re-enter the dispatcher forever.
+           * Mask the CPU interrupt so it cannot storm; up_enable_irq() (or the
+           * driver) re-enables it once the handler is in place.
+           */
+
+          g_irq_nohandler_count++;
+          g_irq_nohandler_last = cpuint;
+          esp_cpu_intr_disable(1u << cpuint);
           irqwarn("No IRQ found for cpuint=%d cpu=%d\n", cpuint, cpu);
           return regs;
         }

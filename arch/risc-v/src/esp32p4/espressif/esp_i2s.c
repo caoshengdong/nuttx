@@ -27,6 +27,7 @@
 #include <nuttx/config.h>
 #include <nuttx/kmalloc.h>
 #include <nuttx/mutex.h>
+#include <nuttx/wqueue.h>
 
 #include <assert.h>
 #include <debug.h>
@@ -893,6 +894,19 @@ static int i2s_rxdma_start(struct esp_i2s_s *priv)
     }
 
   i2s_hal_rx_start(priv->config->ctx);
+
+  /* In full-duplex master mode the WS/BCLK pins are driven by the TX
+   * clock generator and the RX block runs as its internal slave (see
+   * the slot configuration in i2s_configure).  A capture-only stream
+   * would otherwise never see a bit clock: kick the TX side too so
+   * its BCLK/WS free-run (the TX data line idles/repeats silence).
+   */
+
+  if (priv->config->role == I2S_ROLE_MASTER && priv->config->tx_en &&
+      !priv->tx_started)
+    {
+      i2s_hal_tx_start(priv->config->ctx);
+    }
 
   priv->rx_started = true;
 
