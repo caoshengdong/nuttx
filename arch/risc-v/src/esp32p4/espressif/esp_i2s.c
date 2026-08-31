@@ -27,6 +27,7 @@
 #include <nuttx/config.h>
 #include <nuttx/kmalloc.h>
 #include <nuttx/mutex.h>
+#include <nuttx/wdog.h>
 #include <nuttx/wqueue.h>
 
 #include <assert.h>
@@ -286,6 +287,7 @@ struct esp_transport_s
   sq_queue_t pend;              /* A queue of pending transfers */
   sq_queue_t act;               /* A queue of active transfers */
   sq_queue_t done;              /* A queue of completed transfers */
+  struct wdog_s dog;            /* Detects stalled DMA transfers */
   struct work_s work;           /* Supports worker thread operations */
 
   /* Bytes to be written at the beginning of the next DMA buffer */
@@ -370,6 +372,7 @@ static void           i2s_tx_schedule(struct esp_i2s_s *priv,
 
 static IRAM_ATTR int  i2s_rxdma_setup(struct esp_i2s_s *priv,
                                       struct esp_buffer_s *bfcontainer);
+static void           i2s_rx_timeout(wdparm_t arg);
 static void           i2s_rx_worker(void *arg);
 static void           i2s_rx_schedule(struct esp_i2s_s *priv,
                                       lldesc_t *inlink);
@@ -912,6 +915,22 @@ static int i2s_rxdma_start(struct esp_i2s_s *priv)
 
   sq_addlast((sq_entry_t *)bfcontainer, &priv->rx.act);
 
+  /* The I2S API promises to complete a transfer with -ETIMEDOUT when the
+   * caller supplies a timeout.  ESP32-P4 used to store that timeout in the
+   * buffer container but never armed it, so one missed DMA completion left
+   * the active buffer (and every audio layer above it) stuck forever.
+   */
+
+  if (bfcontainer->timeout > 0)
+    {
+      err = wd_start(&priv->rx.dog, bfcontainer->timeout,
+                     i2s_rx_timeout, (wdparm_t)priv);
+      if (err < 0)
+        {
+          i2serr("Failed to start RX DMA watchdog: %d\n", err);
+        }
+    }
+
   return OK;
 }
 
@@ -1132,6 +1151,12 @@ static IRAM_ATTR int i2s_rxdma_setup(struct esp_i2s_s *priv,
 #endif
 
   bfcontainer->buf = kmm_memalign(alignment, bfcontainer->nbytes);
+  if (bfcontainer->buf == NULL)
+    {
+      i2serr("Failed to allocate the RX DMA internal buffer "
+             "[%" PRIu32 " bytes]\n", bfcontainer->nbytes);
+      return -ENOMEM;
+    }
 
 #if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
   esp_cache_msync((void *)bfcontainer,
@@ -1167,6 +1192,50 @@ static IRAM_ATTR int i2s_rxdma_setup(struct esp_i2s_s *priv,
   spin_unlock_irqrestore(&priv->slock, flags);
 
   return ret;
+}
+
+/****************************************************************************
+ * Name: i2s_rx_timeout
+ *
+ * Description:
+ *   Recover an RX transfer for which the DMA completion interrupt did not
+ *   arrive.  Return the timed-out buffer to the audio stack and immediately
+ *   start the next pending transfer.
+ *
+ ****************************************************************************/
+
+static void i2s_rx_timeout(wdparm_t arg)
+{
+  struct esp_i2s_s *priv = (struct esp_i2s_s *)arg;
+  struct esp_buffer_s *bfcontainer;
+  int ret;
+
+  if (sq_empty(&priv->rx.act))
+    {
+      return;
+    }
+
+  i2swarn("RX DMA timed out; restarting capture\n");
+
+  bfcontainer = (struct esp_buffer_s *)sq_remfirst(&priv->rx.act);
+  bfcontainer->result = -ETIMEDOUT;
+  sq_addlast((sq_entry_t *)bfcontainer, &priv->rx.done);
+
+  /* i2s_rxdma_start() resets both the RX peripheral and its GDMA channel
+   * before starting the next pending buffer, which also clears a wedged
+   * transfer.
+   */
+
+  i2s_rxdma_start(priv);
+
+  if (work_available(&priv->rx.work))
+    {
+      ret = work_queue(HPWORK, &priv->rx.work, i2s_rx_worker, priv, 0);
+      if (ret != 0)
+        {
+          i2serr("ERROR: Failed to queue timed-out RX work: %d\n", ret);
+        }
+    }
 }
 
 /****************************************************************************
@@ -1313,6 +1382,9 @@ static void i2s_rx_schedule(struct esp_i2s_s *priv,
 
       if (bfdesc == inlink)
         {
+          /* Cancel this buffer's timeout before starting the next one. */
+
+          wd_cancel(&priv->rx.dog);
           sq_remfirst(&priv->rx.act);
 
           /* Report the result of the transfer */
@@ -1492,17 +1564,20 @@ static void i2s_rx_worker(void *arg)
 
       bfcontainer->apb->nbytes = 0;
 
-      dmadesc = bfcontainer->dma_link[0];
-
-      do
+      if (bfcontainer->result == OK)
         {
-          memcpy(bfcontainer->apb->samp + bfcontainer->apb->nbytes,
-                 (const void *)dmadesc->buf,
-                 dmadesc->length);
-          bfcontainer->apb->nbytes += dmadesc->length;
-          dmadesc = STAILQ_NEXT(dmadesc, qe);
+          dmadesc = bfcontainer->dma_link[0];
+
+          do
+            {
+              memcpy(bfcontainer->apb->samp + bfcontainer->apb->nbytes,
+                     (const void *)dmadesc->buf,
+                     dmadesc->length);
+              bfcontainer->apb->nbytes += dmadesc->length;
+              dmadesc = STAILQ_NEXT(dmadesc, qe);
+            }
+          while (dmadesc != NULL && dmadesc->eof == 1);
         }
-      while (dmadesc != NULL && dmadesc->eof == 1);
 
       /* Perform the RX transfer done callback */
 
@@ -3105,6 +3180,8 @@ static int i2s_receive(struct i2s_dev_s *dev, struct ap_buffer_s *apb,
   if (priv->config->rx_en)
     {
       struct esp_buffer_s *bfcontainer;
+      bool locked = false;
+      bool referenced = false;
       int ret = OK;
       uint32_t nbytes;
       uint32_t nsamp;
@@ -3134,9 +3211,12 @@ static int i2s_receive(struct i2s_dev_s *dev, struct ap_buffer_s *apb,
           goto errout_with_buf;
         }
 
+      locked = true;
+
       /* Add a reference to the audio buffer */
 
       apb_reference(apb);
+      referenced = true;
 
       /* Initialize the buffer container structure */
 
@@ -3164,10 +3244,25 @@ static int i2s_receive(struct i2s_dev_s *dev, struct ap_buffer_s *apb,
       return OK;
 
 errout_with_buf:
-      nxmutex_unlock(&priv->lock);
+      if (locked)
+        {
+          nxmutex_unlock(&priv->lock);
+        }
+
+      if (bfcontainer->buf != NULL)
+        {
+          kmm_free(bfcontainer->buf);
+          bfcontainer->buf = NULL;
+        }
+
       if (i2s_buf_free(priv, bfcontainer) != OK)
         {
           i2serr("Failed to free buffer container\n");
+        }
+
+      if (referenced)
+        {
+          apb_free(apb);
         }
 
       return ret;

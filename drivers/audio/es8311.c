@@ -1320,6 +1320,7 @@ static void es8311_returnbuffers(FAR struct es8311_dev_s *priv)
 static int es8311_processbegin(FAR struct es8311_dev_s *priv)
 {
   FAR struct ap_buffer_s *apb;
+  FAR struct ap_buffer_s *failed = NULL;
   irqstate_t flags;
   uint32_t timeout;
   int ret;
@@ -1397,11 +1398,36 @@ static int es8311_processbegin(FAR struct es8311_dev_s *priv)
       if (ret < 0)
         {
           auderr("I2S transfer failed: %d\n", ret);
+
+          /* The buffer was removed from pendq and counted as in-flight
+           * before the lower-half submission.  Roll both operations back
+           * when I2S rejects it; otherwise the worker waits forever for a
+           * completion that can never arrive.
+           */
+
+          flags = enter_critical_section();
+          DEBUGASSERT(priv->inflight > 0);
+          priv->inflight--;
+          leave_critical_section(flags);
+          failed = apb;
           break;
         }
     }
 
   nxmutex_unlock(&priv->pendlock);
+
+  if (failed != NULL)
+    {
+      apb_free(failed);
+
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+      priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, failed, ret,
+                      NULL);
+#else
+      priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, failed, ret);
+#endif
+    }
+
   return ret;
 }
 
